@@ -1,0 +1,19 @@
+# Terraform local data and secrets
+**/.terraform/**
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfvars
+!**/*.tfvars.example
+**/*.tfplan
+**/*.plan
+**/.secure-state/
+**/.env
+**/.env.*
+**/crash.log
+**/crash.*.log
+**/*.pem
+**/*.key
+**/*.pfx
+# Generated API bundles are kept out; build them from reviewed application source.
+api/dist/*.zip
+!aws/u2-lambda-web/web.zip

@@ -1,0 +1,4 @@
+# Supply these account-specific values locally; do not commit a filled-in file.
+compartment_ocid         = "REPLACE_WITH_YOUR_COMPARTMENT_OCID"
+object_storage_namespace = "REPLACE_WITH_NAMESPACE_FROM_OCI_CLI"
+# bucket_name = "norcom-academic-backups-demo-unique"

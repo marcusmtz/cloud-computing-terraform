@@ -1,0 +1,255 @@
+$ErrorActionPreference = 'Stop'
+$mode = '${mode}'
+$proxyUrl = '${proxy_url}'
+$proxyHost = '${proxy_host}'
+$proxyPort = 3128
+$backupDir = 'C:\ProgramData\NORCOM\ProxyBaseline'
+$baselinePath = Join-Path $backupDir 'baseline.json'
+$ssmKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\AmazonSSMAgent'
+$cwPath = 'C:\ProgramData\Amazon\AmazonCloudWatchAgent\common-config.toml'
+$hcmPath = 'C:\ProgramData\HybridConnectionManager\appsettings.json'
+$hcmServicePath = 'C:\Program Files (x86)\HybridConnectionManager\Service\appsettings.json'
+
+function Set-ProxyBackupAcl {
+    param([string]$Path)
+    & icacls.exe $Path /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'No se pudo restringir el acceso a la copia de configuración del proxy.' }
+}
+
+function Get-HcmProxySnapshot {
+    param([string]$Path)
+    $fileExists = Test-Path -LiteralPath $Path
+    $proxyExists = $false
+    $settings = $null
+    if ($fileExists) {
+        $config = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        $property = $config.PSObject.Properties['ProxySettings']
+        if ($null -ne $property) {
+            $proxyExists = $true
+            $settings = [ordered]@{}
+            foreach ($name in @('UseProxy', 'ProxyAddress', 'BypassProxyOnLocal', 'BypassList')) {
+                $setting = $property.Value.PSObject.Properties[$name]
+                if ($null -ne $setting) { $settings[$name] = $setting.Value }
+            }
+        }
+    }
+    return [pscustomobject]@{ FileExists = $fileExists; ProxySettingsExists = $proxyExists; ProxySettings = $settings }
+}
+
+function Save-Baseline {
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+    Set-ProxyBackupAcl -Path $backupDir
+
+    $hcmSnapshot = Get-HcmProxySnapshot -Path $hcmPath
+    $hcmServiceSnapshot = Get-HcmProxySnapshot -Path $hcmServicePath
+
+    $ssmProperty = (Get-ItemProperty -LiteralPath $ssmKey -Name Environment -ErrorAction SilentlyContinue).Environment
+    $ssmEnvironmentExists = $null -ne $ssmProperty
+    $baseline = [ordered]@{
+        HcmFileExists = $hcmSnapshot.FileExists
+        HcmProxySettingsExists = $hcmSnapshot.ProxySettingsExists
+        HcmProxySettings = $hcmSnapshot.ProxySettings
+        HcmServiceFileExists = $hcmServiceSnapshot.FileExists
+        HcmServiceProxySettingsExists = $hcmServiceSnapshot.ProxySettingsExists
+        HcmServiceProxySettings = $hcmServiceSnapshot.ProxySettings
+        CloudWatchFileExists = (Test-Path -LiteralPath $cwPath)
+        SsmEnvironmentExists = $ssmEnvironmentExists
+        SsmEnvironment = if ($ssmEnvironmentExists) { @($ssmProperty) } else { @() }
+    }
+
+    if ($baseline.CloudWatchFileExists) {
+        Copy-Item -LiteralPath $cwPath -Destination (Join-Path $backupDir 'common-config.toml') -Force
+    }
+    & netsh.exe winhttp dump | Set-Content -LiteralPath (Join-Path $backupDir 'winhttp.txt') -Encoding ASCII
+    if ($LASTEXITCODE -ne 0) { throw 'No se pudo guardar la configuración WinHTTP actual.' }
+
+    $baseline | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $baselinePath -Encoding UTF8
+    Set-ProxyBackupAcl -Path $backupDir
+}
+
+function Write-JsonFile {
+    param([string]$Path, [object]$Value)
+    $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Ensure-HcmServiceBaseline {
+    param([object]$Baseline)
+    if ($null -ne $Baseline.PSObject.Properties['HcmServiceFileExists']) { return }
+    $snapshot = Get-HcmProxySnapshot -Path $hcmServicePath
+    $Baseline | Add-Member -MemberType NoteProperty -Name HcmServiceFileExists -Value $snapshot.FileExists
+    $Baseline | Add-Member -MemberType NoteProperty -Name HcmServiceProxySettingsExists -Value $snapshot.ProxySettingsExists
+    $Baseline | Add-Member -MemberType NoteProperty -Name HcmServiceProxySettings -Value $snapshot.ProxySettings
+    Write-JsonFile -Path $baselinePath -Value $Baseline
+    Set-ProxyBackupAcl -Path $backupDir
+}
+
+function Set-HcmProxy {
+    param([bool]$Enabled, [object]$PreviousSettings, [string]$Path = $hcmPath)
+    if (-not (Test-Path -LiteralPath $Path)) { throw 'Falta un archivo de configuración de Hybrid Connection Manager en Windows.' }
+    $hcmConfig = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $proxyProperty = $hcmConfig.PSObject.Properties['ProxySettings']
+    if (-not $Enabled -and $null -eq $PreviousSettings) {
+        if ($null -ne $proxyProperty) { $hcmConfig.PSObject.Properties.Remove('ProxySettings') }
+        Write-JsonFile -Path $Path -Value $hcmConfig
+        return
+    }
+    if ($null -eq $proxyProperty) {
+        $hcmConfig | Add-Member -MemberType NoteProperty -Name ProxySettings -Value ([pscustomobject]@{})
+        $proxySettings = $hcmConfig.ProxySettings
+    } else {
+        $proxySettings = $proxyProperty.Value
+    }
+
+    if ($Enabled) {
+        $proxySettings.UseProxy = $true
+        $proxySettings.ProxyAddress = $proxyUrl
+        $proxySettings.BypassProxyOnLocal = $false
+        $bypassPattern = '^(localhost|127\.0\.0\.1|169\.254\.169\.254|10\.42\..*)$'
+        $bypassProperty = $proxySettings.PSObject.Properties['BypassList']
+        if ($null -ne $bypassProperty -and $bypassProperty.Value -is [array]) {
+            $proxySettings.BypassList = @($bypassPattern)
+        } elseif ($null -ne $bypassProperty) {
+            $proxySettings.BypassList = $bypassPattern
+        } else {
+            $proxySettings | Add-Member -MemberType NoteProperty -Name BypassList -Value $bypassPattern
+        }
+    } elseif ($null -ne $PreviousSettings) {
+        foreach ($name in @('UseProxy', 'ProxyAddress', 'BypassProxyOnLocal', 'BypassList')) {
+            $prior = $PreviousSettings.PSObject.Properties[$name]
+            if ($null -ne $prior) {
+                $current = $proxySettings.PSObject.Properties[$name]
+                if ($null -eq $current) { $proxySettings | Add-Member -MemberType NoteProperty -Name $name -Value $prior.Value }
+                else { $proxySettings.$name = $prior.Value }
+            }
+        }
+    }
+
+    Write-JsonFile -Path $Path -Value $hcmConfig
+}
+
+function Restart-HcmService {
+    $hcmService = Get-Service -Name 'HybridConnectionManagerService' -ErrorAction SilentlyContinue
+    if ($null -eq $hcmService) { throw 'No se encontró el servicio de Hybrid Connection Manager.' }
+    Restart-Service -Name $hcmService.Name -Force
+    (Get-Service -Name $hcmService.Name).WaitForStatus('Running', [TimeSpan]::FromSeconds(60))
+}
+
+function Set-CloudWatchProxy {
+    param([bool]$Enabled, [bool]$HadBaselineFile)
+    if ($Enabled) {
+        if (-not (Test-Path -LiteralPath $cwPath)) { New-Item -ItemType File -Path $cwPath -Force | Out-Null }
+        $content = Get-Content -LiteralPath $cwPath -Raw
+        $content = [regex]::Replace($content, '(?ms)^\[proxy\]\s*\r?\n.*?(?=^\[|\z)', '').TrimEnd()
+        $proxyBlock = "[proxy]`r`nhttp_proxy = `"$proxyUrl`"`r`nhttps_proxy = `"$proxyUrl`"`r`nno_proxy = `"169.254.169.254,localhost,127.0.0.1`""
+        $updated = if ($content) { "$content`r`n`r`n$proxyBlock`r`n" } else { "$proxyBlock`r`n" }
+        Set-Content -LiteralPath $cwPath -Value $updated -Encoding UTF8
+    } elseif ($HadBaselineFile) {
+        Copy-Item -LiteralPath (Join-Path $backupDir 'common-config.toml') -Destination $cwPath -Force
+    } else {
+        Remove-Item -LiteralPath $cwPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $cwService = Get-Service -Name 'AmazonCloudWatchAgent' -ErrorAction SilentlyContinue
+    if ($null -ne $cwService) {
+        Restart-Service -Name $cwService.Name -Force
+        (Get-Service -Name $cwService.Name).WaitForStatus('Running', [TimeSpan]::FromSeconds(60))
+    }
+}
+
+function Schedule-SsmAgentRestart {
+    $taskName = 'NORCOM-ApplySSMProxySettings'
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    $action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument '-NoProfile -NonInteractive -WindowStyle Hidden -Command "Restart-Service -Name AmazonSSMAgent -Force"'
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(45)
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+}
+
+function Get-ProxyHttpStatus {
+    param([string]$Url)
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.Proxy = New-Object System.Net.WebProxy($proxyUrl, $true, @('localhost', '127.0.0.1', '169.254.169.254', '10.*'))
+    $request.Timeout = 20000
+    $request.AllowAutoRedirect = $false
+    try {
+        $response = $request.GetResponse()
+        $status = [int]$response.StatusCode
+        $response.Close()
+        return $status
+    } catch [System.Net.WebException] {
+        if ($null -eq $_.Exception.Response) { throw }
+        $status = [int]$_.Exception.Response.StatusCode
+        $_.Exception.Response.Close()
+        return $status
+    }
+}
+
+if ($mode -eq 'Configure') {
+    if (-not (Test-NetConnection -ComputerName $proxyHost -Port $proxyPort -InformationLevel Quiet)) {
+        throw 'El Windows Server no puede conectar por TCP/3128 con el proxy privado.'
+    }
+    if (-not (Test-Path -LiteralPath $baselinePath)) { Save-Baseline }
+    $baseline = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json
+    Ensure-HcmServiceBaseline -Baseline $baseline
+    $baseline = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json
+
+    Set-HcmProxy -Enabled $true -PreviousSettings $null
+    if (Test-Path -LiteralPath $hcmServicePath) { Set-HcmProxy -Enabled $true -PreviousSettings $null -Path $hcmServicePath }
+    Restart-HcmService
+
+    Set-CloudWatchProxy -Enabled $true -HadBaselineFile $baseline.CloudWatchFileExists
+    $cwContent = Get-Content -LiteralPath $cwPath -Raw
+    if ($cwContent -notmatch '(?m)^\[proxy\]') { throw 'CloudWatch Agent no conservó el bloque proxy.' }
+
+    $ssmEnvironment = @("http_proxy=$proxyUrl", "https_proxy=$proxyUrl", 'no_proxy=169.254.169.254,localhost,127.0.0.1')
+    New-ItemProperty -LiteralPath $ssmKey -Name Environment -Value $ssmEnvironment -PropertyType MultiString -Force | Out-Null
+
+    $winhttp = & netsh.exe winhttp set proxy proxy-server="$proxyHost`:$proxyPort" bypass-list="169.254.169.254;localhost;127.*;10.*" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw 'No se pudo configurar el proxy WinHTTP.' }
+
+    $allowedStatus = Get-ProxyHttpStatus -Url "https://ssm.${aws_region}.amazonaws.com/"
+    if ($allowedStatus -lt 400 -or $allowedStatus -ge 500 -or $allowedStatus -eq 403) {
+        throw "El endpoint AWS permitido no respondió como se esperaba a través del proxy (HTTP $allowedStatus)."
+    }
+    $deniedStatus = Get-ProxyHttpStatus -Url 'https://example.com/'
+    if ($deniedStatus -ne 403) { throw "El dominio externo de prueba debía recibir HTTP 403; recibió HTTP $deniedStatus." }
+
+    $hcmService = Get-Service -Name 'HybridConnectionManagerService'
+    $cwService = Get-Service -Name 'AmazonCloudWatchAgent' -ErrorAction SilentlyContinue
+    if ($hcmService.Status -ne 'Running' -or ($cwService -and $cwService.Status -ne 'Running')) {
+        throw 'HCM o CloudWatch Agent no permaneció Running tras usar la configuración del proxy.'
+    }
+    Schedule-SsmAgentRestart
+    Write-Output "NORCOM_PROXY_CLIENTS_CONFIGURED=1; HCM=Running; CloudWatch=$([bool]$cwService); WinHTTP=Configured; AllowHTTP=$allowedStatus; DenyHTTP=$deniedStatus; SSMAgentRestart=Scheduled"
+} elseif ($mode -eq 'Restore') {
+    if (-not (Test-Path -LiteralPath $baselinePath)) {
+        Write-Output 'NORCOM_PROXY_CLIENTS_RESTORE=NotRequired; baseline not found.'
+        exit 0
+    }
+    $baseline = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json
+
+    if ($baseline.HcmFileExists) {
+        Set-HcmProxy -Enabled $false -PreviousSettings $baseline.HcmProxySettings
+    }
+    if ($baseline.HcmServiceFileExists) {
+        Set-HcmProxy -Enabled $false -PreviousSettings $baseline.HcmServiceProxySettings -Path $hcmServicePath
+    }
+    Restart-HcmService
+    Set-CloudWatchProxy -Enabled $false -HadBaselineFile $baseline.CloudWatchFileExists
+
+    if ($baseline.SsmEnvironmentExists) {
+        New-ItemProperty -LiteralPath $ssmKey -Name Environment -Value @($baseline.SsmEnvironment) -PropertyType MultiString -Force | Out-Null
+    } else {
+        Remove-ItemProperty -LiteralPath $ssmKey -Name Environment -ErrorAction SilentlyContinue
+    }
+
+    $netshPath = Join-Path $backupDir 'winhttp.txt'
+    if (Test-Path -LiteralPath $netshPath) {
+        & netsh.exe exec $netshPath | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'No se pudo restaurar la configuración WinHTTP anterior.' }
+    }
+    Schedule-SsmAgentRestart
+    Remove-Item -LiteralPath $backupDir -Recurse -Force
+    Write-Output 'NORCOM_PROXY_CLIENTS_RESTORE=Scheduled; SSMAgentRestart=Scheduled'
+} else {
+    throw "Mode no válido para la configuración del proxy: $mode"
+}

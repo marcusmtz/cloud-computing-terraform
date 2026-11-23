@@ -1,0 +1,8 @@
+aws_region              = "us-east-1"
+project_name            = "norcom"
+environment             = "lab"
+vpc_cidr                = "10.42.0.0/16"
+database_instance_class = "db.t3.micro"
+
+# Azure aloja el portal y reenvía el catálogo desde el servidor; el navegador no invoca API Gateway directamente.
+web_origin = "https://norcom-portal-demo.azurewebsites.net"

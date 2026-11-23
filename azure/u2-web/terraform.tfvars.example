@@ -1,0 +1,2 @@
+# Optional: select the subscription with Azure CLI, or set its ID here.
+azure_subscription_id = null

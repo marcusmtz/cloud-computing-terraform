@@ -1,0 +1,2 @@
+# Replace with your own AWS account ID before planning.
+expected_aws_account_id = "123456789012"
